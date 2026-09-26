@@ -47,7 +47,7 @@ work immediately. The page offers:
 - **Status chips** in the header showing the live `llm.active` model, embedding signature and chunk count.
   "新会话" (new session) mints a fresh `session_id`, dropping multi-turn context.
 
-> Requirements: `chromadb`, `pypdf`, `reportlab` (`python -m pip install -r requirements.txt`).
+> Requirements: `chromadb`, `pypdf`, `reportlab`, `rapidocr-onnxruntime`, `pillow` (`python -m pip install -r requirements.txt`).
 
 ### LLM & embedding configuration (config.json + config.local.json, layered)
 
@@ -111,7 +111,7 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
       -> retrieve (vector | hybrid [+rerank]) -> low-score refusal (vector cosine on semantic embeddings / pre-rerank fusion score on hash)
       -> llm (DeepSeek / Zhipu GLM, OpenAI-compatible) -> insufficient-context detection / numeric grounding / PII redaction
       -> logging, caching, session update
-Data plane: data/*.(txt|pdf|ocr.txt) -> ingest.py + pdf_reader.py -> store (chunking + ollama bge-m3 | zhipu embedding-3 | hash) -> Chroma (chroma_data/)
+Data plane: data/*.(txt|pdf) -> ingest.py + pdf_reader.py (text PDF via pypdf; scanned PDF auto-RapidOCR) -> store (chunking + ollama bge-m3 | zhipu embedding-3 | hash) -> Chroma (chroma_data/)
 ```
 
 | File | Responsibility |
@@ -121,11 +121,11 @@ Data plane: data/*.(txt|pdf|ocr.txt) -> ingest.py + pdf_reader.py -> store (chun
 | `settings.py` | Config loading: `config.json` (template) + `config.local.json` (secrets, gitignored), deep-merged, hot-read |
 | `store.py` | Chunking; pluggable embeddings (`OpenAICompatEmbeddingFunction` semantic — local Ollama bge-m3 / cloud Zhipu embedding-3; `LocalHashEmbeddingFunction` offline lexical fallback); collection fingerprint check; embedded Chroma |
 | `retrieve.py` | Vector / BM25(k1=1.5,b=0.75, inverted stats cached per corpus) fusion `0.55v+0.45b` / light rerank `0.55s+0.35cover+0.10phrase` (keeps `raw_score` for threshold gating) |
-| `llm.py` | Preset resolution (`llm.active`), OpenAI-compatible HTTP (timeout/max-tokens configurable, default 8s/300; a preset may override `timeout_seconds`), CoT stripping `strip_thinking`, one auto-retry then refusal on unusable output, insufficient-context detection (`+insufficient`), prompt version in the cache key |
+| `llm.py` | Preset resolution (`llm.active`), OpenAI-compatible HTTP (timeout/max-tokens configurable, default 8s/400; a preset may override `timeout_seconds` / `reasoning_effort` — Zhipu glm-5.x always thinks, `low` cuts reasoning tokens from 300+ to 0), CoT stripping `strip_thinking`, `finish_reason=length` truncation detection, one auto-retry each for unusable output and transient failures (timeout/network/5xx), then refusal; insufficient-context detection (`+insufficient`); prompt version in the cache key |
 | `sessions.py` | In-memory multi-turn + cue-gated rewrite + TTL eviction (only concatenates the last 2 questions when anaphora/continuation cues exist, so independent questions are not diluted) |
 | `safety.py` | CN/EN injection regexes, out-of-scope keywords, PII redaction (phone/email/ID/bank card) |
 | `cache.py` | `sha256(q+mode+rerank)` disk cache, TTL 600s by default, bad answers never replayed |
-| `pdf_reader.py` | Text-PDF extraction (pypdf first, falls back to Tj/TJ text-operator parsing) |
+| `pdf_reader.py` | PDF extraction: text PDFs via pypdf; no text layer → scanned → RapidOCR on the embedded bitmaps (explicit dependency, errors loudly, no silent fallback); returns `(text, used_ocr)` for `metadata.ocr=true` |
 | `eval.py` / `scripts/load_test.py` / `scripts/ops_report.py` | One-click evaluation / load test / ops report |
 
 <a id="s3"></a>
@@ -189,17 +189,22 @@ cache automatically, and answers where the model declares insufficient context a
 <a id="s5"></a>
 ## 5. Knowledge-base ingestion and the vector store
 
-### 5.1 Two paths: text PDF vs scanned page
+### 5.1 Two paths: text PDF vs scanned PDF
 
 | Corpus | Path | Code |
 |---|---|---|
-| Text PDF (`hr_policy_bilingual.pdf`, selectable text) | `pypdf.PdfReader` → per-page `extract_text()`, then `split_pdf_paragraphs()` breaks sections on heading lines (extracted PDF text has no blank lines) | `pdf_reader.extract_pdf_text`, `ingest.split_pdf_paragraphs` |
-| pypdf missing / extraction empty | Fallback: read raw bytes as latin-1, regex-grab `(...) Tj` and `[...] TJ` text-drawing operators, unescape them | `pdf_reader._raw_parse` |
-| Scanned page | **No OCR engine runs inside this project**: the corpus is stored as post-OCR text (`.ocr.txt`, or filename containing `scanned`); chunks get `metadata.ocr=true` so retrieval and logs can trace the origin | `ingest.is_ocr`, `store.chunk_text(ocr=True)` |
+| Text PDF (`hr_policy_bilingual.pdf`, selectable text) | `pypdf.PdfReader` → per-page `extract_text()`, then `split_pdf_paragraphs()` breaks sections on heading lines (both CN/EN-mixed and pure-Chinese short headings are recognized) | `pdf_reader.extract_pdf_text`, `ingest.split_pdf_paragraphs` |
+| Scanned PDF (`scanned_leave.pdf`, full-page bitmap, no text layer) | pypdf extracts nothing → classified as scanned → **RapidOCR** runs on each page's embedded bitmap (ONNX build of PaddleOCR models: pure pip, offline, Apache-2.0), ~4–5s per page on CPU — ingest-time only, never on the QA path | `pdf_reader.extract_pdf_text`, `scripts/make_scanned_pdf.py` |
 
-In short, "PDF recognition" here means two-level text-layer extraction; image OCR is an upstream
-step. Swapping in a real OCR engine (PaddleOCR / Tesseract) only means dropping its output in
-`data/` as a `.ocr.txt` file — the pipeline stays unchanged.
+- `scanned_leave.pdf` is generated by `scripts/make_scanned_pdf.py`: text rendered onto a paper-like
+  image with skew/noise/blur — a genuine image-only PDF (pypdf extracts `""` from it; easy to verify).
+- The `metadata.ocr` flag comes from the **real extraction path** (the `used_ocr` returned by
+  `pdf_reader.extract_pdf_text`), not filename guessing; retrieval hits and logs can trace
+  "this answer is grounded in OCR'd scanned material".
+- A missing OCR dependency raises an explicit error with install instructions — **no silent
+  fallback**, the same principle as the LLM path's "no silent degradation".
+- Swapping OCR engines (PaddleOCR / Tesseract / Docling) only touches the OCR call site in
+  `pdf_reader.py`.
 
 ### 5.2 Database: embedded Chroma (no separate server)
 
@@ -238,7 +243,7 @@ step. Swapping in a real OCR engine (PaddleOCR / Tesseract) only means dropping 
 5. The refusal threshold is calibrated per embedding distribution (semantic `bge-m3`/`embedding-3` =
    0.55 on the vector cosine; `hash` = 0.12 on the fusion score); recalibrate after any embedding swap
    (method in `docs/issue_diagnosis.md` issue 5 and `docs/evaluation.md` §2).
-6. OCR for scanned PDFs happens during corpus preparation (§5.1); the service only consumes OCR text.
+6. OCR for scanned PDFs runs automatically at ingest time (`pdf_reader.py`, RapidOCR, ~4–5s per page on CPU, offline stage only); the QA path consumes the OCR'd text with no added latency.
 7. The default embedding needs the local Ollama server running (installed as a background service on
    Windows; bge-m3 runs fine without a GPU). Without Ollama, point `embedding.provider` at `zhipu`
    (cloud, reuses the Zhipu key) or `hash` (fully offline) and re-run `python ingest.py`.
@@ -270,7 +275,7 @@ step. Swapping in a real OCR engine (PaddleOCR / Tesseract) only means dropping 
   retry, then a uniform refusal; a single request can never hang 30s and blow the 10s SLA.
 - Trade-offs: dropping to a 7B-class model halves latency but raises numeric/transcription errors in
   clauses; a 72B-class model improves quality but cannot sustain the ≥5-concurrency target on one instance.
-- Prompt constraints (`llm.SYSTEM_PROMPT` v3): facts only from the retrieved material, single plain-text
+- Prompt constraints (`llm.SYSTEM_PROMPT` v5): facts only from the retrieved material, single plain-text
   paragraph ≤150 characters, source filename at the end, **answer in the language of the question**.
   The A/B experiment (`scripts/prompt_experiment.py` → `reports/prompt_experiment.md`) shows large gains
   in Faithfulness and Style Consistency; genuine hallucinations (invented numbers/clauses) are caught by

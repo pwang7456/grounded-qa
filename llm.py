@@ -1,6 +1,7 @@
 """OpenAI 兼容 /chat/completions 客户端（DeepSeek / 智谱 GLM，由 config.json 预设切换）。
 
-配置：config.json → `llm.active`（预设名）+ `llm.providers.<预设>.{base_url, model, api_key}`
+配置：config.json → `llm.active`（预设名）+ `llm.providers.<预设>.{base_url, model, api_key}`；
+预设可带 `thinking`（如智谱 GLM 的 {"type": "disabled"} 关闭思考模式）与 `timeout_seconds`。
 """
 import json
 import re
@@ -19,10 +20,10 @@ class LLMUnavailable(Exception):
 
 
 class LLMUnusableOutput(LLMUnavailable):
-    """调用成功但输出不可用（CoT 残留 / 回显问题 / 过短）。"""
+    """调用成功但输出不可用（CoT 残留 / 回显问题 / 过短 / max_tokens 截断）。"""
 
 
-PROMPT_VERSION = "v3"  # 提示词版本；参与缓存 salt，改提示词自动失效旧缓存
+PROMPT_VERSION = "v5"  # 提示词与生成配置版本；参与缓存 salt，变更自动失效旧缓存
 
 
 def _llm_cfg() -> dict:
@@ -73,7 +74,7 @@ SYSTEM_PROMPT = (
     "4. 直接复述资料中的关键事实与数字，尽量沿用资料原文措辞。\n"
     "5. 答案末尾附来源，格式：（来源：文件名）。\n"
     "6. 禁止输出思考过程、Thinking、分析步骤，直接给出最终答案。\n"
-    "7. 使用与提问相同的语言作答（中文提问用中文，英文提问用 English）。"
+    "7. 回答语言必须与提问语言一致：英文提问必须用 English 作答，中文提问用中文——即使资料全是中文。"
 )
 
 
@@ -126,7 +127,7 @@ def _call_openai(prompt: str, history=None, timeout=None):
     preset = active_preset()
     if timeout is None:
         timeout = float(preset.get("timeout_seconds") or cfg.get("timeout_seconds") or 8)
-    max_tokens = int(cfg.get("max_tokens") or 300)
+    max_tokens = int(cfg.get("max_tokens") or 400)
     body = {
         "model": model_name(),
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -136,6 +137,9 @@ def _call_openai(prompt: str, history=None, timeout=None):
         "max_tokens": max_tokens,
         "stream": False,
     }
+    reasoning_effort = preset.get("reasoning_effort")
+    if reasoning_effort:
+        body["reasoning_effort"] = str(reasoning_effort)  # 思考力度（智谱 glm-5.x 始终思考，low/high/max）
     headers = {"Content-Type": "application/json"}
     key = api_key()
     if key:
@@ -158,30 +162,43 @@ def _call_openai(prompt: str, history=None, timeout=None):
         raise LLMUnavailable(f"HTTP {e.code} from {_base_url()}: {detail}")
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError) as e:
         raise LLMUnavailable(f"LLM endpoint unreachable: {e}")
-    choice = data["choices"][0]["message"]["content"]
+    choice = data["choices"][0]
+    content = choice.get("message", {}).get("content") or ""
     usage = data.get("usage") or {}
-    return choice, {
+    return content, {
         "prompt_tokens": int(usage.get("prompt_tokens", 0)),
         "completion_tokens": int(usage.get("completion_tokens", 0)),
         "total_tokens": int(usage.get("total_tokens", 0)),
-    }
+    }, choice.get("finish_reason") or ""
 
 
 def generate(question: str, hits, history=None):
-    """返回 (answer_text, provider, usage)；输出不可用时自动重试一次后抛 LLMUnusableOutput。"""
+    """返回 (answer_text, provider, usage)；最多尝试两次，两类失败都重试一次：
+    瞬时调用失败（超时/网络/5xx）→ LLMUnavailable；输出不可用（CoT 残留/过短/截断）→ LLMUnusableOutput。"""
     name = active_name()
     if not api_key():
         raise LLMUnavailable(
             f"api_key 未配置：请在 config.local.json 的 llm.providers.{name} 填 api_key")
     prompt = build_prompt(question, hits)
     total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    raw = ""
-    for _ in range(2):  # 偶发 CoT 残留/空输出：重试一次
-        raw, usage = _call_openai(prompt, history=history)
+    last_transient, last_raw = None, ""
+    for _ in range(2):
+        try:
+            raw, usage, finish_reason = _call_openai(prompt, history=history)
+        except LLMUnavailable as e:
+            if e.usage:
+                for k in total:
+                    total[k] += e.usage.get(k, 0)
+            last_transient, last_raw = e, ""
+            continue
         for k in total:
             total[k] += usage.get(k, 0)
         clean = strip_thinking(raw)
-        if not looks_like_bad_answer(clean):
+        if finish_reason != "length" and not looks_like_bad_answer(clean):
             return clean, name, total
+        last_transient, last_raw = None, raw  # max_tokens 截断或坏输出：重试一次
+    if last_transient is not None:
+        raise last_transient
     raise LLMUnusableOutput(
-        f"模型输出不可用（CoT 残留/回显/过短），原始输出片段：{raw.strip()[:150]!r}", total)
+        f"模型输出不可用（CoT 残留/回显/过短/max_tokens 截断），原始输出片段：{last_raw.strip()[:150]!r}",
+        total)

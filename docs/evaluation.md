@@ -1,7 +1,7 @@
 # 评测方法与指标定义
 
 一键评测：`python eval.py`（无需先启动服务，直接进程内跑全流水线；评测自动关闭缓存，保证可复现）。
-评测集：`eval/questions.jsonl`，20 个应答题（中英双语、覆盖 6 个知识文件含 PDF 与 OCR 页）+ 10 个应拒答题（越界 o01-o05 / 注入 i01-i04 / 低置信 l01）。
+评测集：`eval/questions.jsonl`，20 个应答题（中英双语、覆盖 6 个知识文件，含文字 PDF 与扫描型 PDF（入库时 RapidOCR 真实识别））+ 10 个应拒答题（越界 o01-o05 / 注入 i01-i04 / 低置信 l01）。
 
 ## 1. 检索指标（三配置对比：vector / hybrid / hybrid+rerank）
 

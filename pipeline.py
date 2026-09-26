@@ -18,17 +18,17 @@ LOG_PATH = os.path.join(BASE_DIR, "logs", "rag.jsonl")
 
 REFUSAL_LOW_CONF = (
     "抱歉，知识库中没有找到与您的问题足够匹配的资料，无法可靠回答。"
-    "建议换一种问法、补充制度名称，或联系 HR（hr@example.com）咨询。"
+    "建议换一种问法、补充制度名称，或联系 HR 服务台（内线 8000）咨询。"
 )
 
 REFUSAL_LLM_UNAVAILABLE = (
-    "抱歉，模型服务暂时不可用，请稍后重试；如急需可联系 HR（hr@example.com）。"
+    "抱歉，模型服务暂时不可用，请稍后重试；如急需可联系 HR 服务台（内线 8000）。"
 )
 REFUSAL_LLM_UNUSABLE = (
-    "抱歉，模型本次未能给出可靠答复，请换个问法再试；如急需可联系 HR（hr@example.com）。"
+    "抱歉，模型本次未能给出可靠答复，请换个问法再试；如急需可联系 HR 服务台（内线 8000）。"
 )
 REFUSAL_EMBEDDING_UNAVAILABLE = (
-    "抱歉，检索服务暂时不可用，请稍后重试；如急需可联系 HR（hr@example.com）。"
+    "抱歉，检索服务暂时不可用，请稍后重试；如急需可联系 HR 服务台（内线 8000）。"
 )
 
 _NO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}

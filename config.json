@@ -18,7 +18,7 @@
   "llm": {
     "active": "zhipu",
     "timeout_seconds": 8,
-    "max_tokens": 300,
+    "max_tokens": 400,
     "providers": {
       "deepseek": {
         "base_url": "https://api.deepseek.com/v1",
@@ -28,7 +28,8 @@
       "zhipu": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "model": "glm-5.3-flash",
-        "api_key": ""
+        "api_key": "",
+        "reasoning_effort": "low"
       }
     }
   }

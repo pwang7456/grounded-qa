@@ -38,7 +38,7 @@ python app.py         &REM 起服务：http://127.0.0.1:8788，Ctrl+C 停止
 - **演示入口按钮**：正常问答 / 报销 / 多轮追问（代词补全）/ 英文 / 越界拒答 / 注入拒答 / 低置信拒答，一条点击即复现对应链路；
 - **顶部状态胶囊**：实时显示当前 `llm.active` 模型、embedding 签名、chunk 数，便于演示前确认配置；「新会话」按钮换一个 session_id（清掉多轮上下文）。
 
-> 依赖清单：`chromadb`、`pypdf`、`reportlab`（`python -m pip install -r requirements.txt`）。
+> 依赖清单：`chromadb`、`pypdf`、`reportlab`、`rapidocr-onnxruntime`、`pillow`（`python -m pip install -r requirements.txt`）。
 
 ### 配置大模型与 embedding（config.json + config.local.json 双层）
 
@@ -88,7 +88,7 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
   → app.py(ThreadingHTTPServer :8788) → pipeline.answer_question
       safety(注入/越界→拒答) → cache → sessions(追问线索感知改写) → retrieve(vector|hybrid[+rerank])
       → 低分拒答(语义 embedding 用向量余弦 / hash 用 rerank 前融合分) → llm(DeepSeek / 智谱 GLM，OpenAI 兼容) → 资料不足识别/数字接地/PII 脱敏 → 日志/缓存/会话
-数据面：data/*.(txt|pdf|ocr.txt) → ingest.py + pdf_reader.py → store(分块+embedding：ollama bge-m3|zhipu embedding-3|hash) → Chroma(chroma_data/)
+数据面：data/*.(txt|pdf) → ingest.py + pdf_reader.py(文字型走 pypdf；扫描型自动 RapidOCR) → store(分块+embedding：ollama bge-m3|zhipu embedding-3|hash) → Chroma(chroma_data/)
 ```
 
 | 文件 | 职责 |
@@ -98,11 +98,11 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
 | `settings.py` | 配置加载：`config.json`（模板）+ `config.local.json`（密钥，gitignore）深度合并，热读 |
 | `store.py` | 分块；可配置 embedding（`OpenAICompatEmbeddingFunction` 语义：本机 Ollama bge-m3 / 云端智谱 embedding-3；`LocalHashEmbeddingFunction` 离线词面兜底）；collection 指纹校验；嵌入式 Chroma |
 | `retrieve.py` | 向量 / BM25(k1=1.5,b=0.75，倒排统计随语料缓存) 融合 `0.55v+0.45b` / 轻量 rerank `0.55s+0.35cover+0.10phrase`（附 `raw_score` 供阈值判定） |
-| `llm.py` | 模型预设解析（`llm.active`）、OpenAI 兼容 HTTP（超时/最大输出可配置，默认 8s/300；预设级 `timeout_seconds` 可覆盖）、CoT 清洗 `strip_thinking`、坏输出自动重试一次后按拒答处理、自述资料不足识别（`+insufficient`）、提示词版本参与缓存键 |
+| `llm.py` | 模型预设解析（`llm.active`）、OpenAI 兼容 HTTP（超时/最大输出可配置，默认 8s/400；预设级 `timeout_seconds` / `reasoning_effort` 可覆盖——智谱 glm-5.x 始终思考，`low` 把推理 token 从 300+ 压到 0）、CoT 清洗 `strip_thinking`、`finish_reason=length` 截断识别、坏输出与瞬时故障（超时/网络/5xx）各自动重试一次后按拒答处理、自述资料不足识别（`+insufficient`）、提示词版本参与缓存键 |
 | `sessions.py` | 内存多轮 + 追问线索感知改写 + TTL 淘汰；仅含指代/延续线索时拼接最近 2 问，独立新问题不被历史稀释 |
 | `safety.py` | 中英注入正则、越界关键词、PII 脱敏（手机/邮箱/身份证/银行卡） |
 | `cache.py` | `sha256(q+mode+rerank)` 磁盘缓存，TTL 默认 600s，坏答案不回放 |
-| `pdf_reader.py` | 文字 PDF 抽取（pypdf 优先，失败退回 Tj/TJ 文本算子解析） |
+| `pdf_reader.py` | PDF 抽取：文字型走 pypdf 搬运字符；无文字层判定为扫描件，对页面嵌入位图跑 RapidOCR（显式依赖，失败即报错，不静默兜底）；返回 `(text, used_ocr)` 供入库打 `metadata.ocr=true` |
 | `eval.py` / `scripts/load_test.py` / `scripts/ops_report.py` | 一键评测 / 压测 / 运维报表 |
 
 <a id="s3"></a>
@@ -141,15 +141,17 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
 <a id="s5"></a>
 ## 5. 知识库摄入与向量数据库
 
-### 5.1 PDF / 扫描页的两条链路
+### 5.1 PDF / 扫描 PDF 的两条链路
 
 | 语料 | 链路 | 代码位置 |
 |---|---|---|
-| 文字型 PDF（`hr_policy_bilingual.pdf`，可复制选中） | `pypdf.PdfReader` 逐页 `extract_text()` → `split_pdf_paragraphs()` 按标题行切段（PDF 抽出的文本无空行） | `pdf_reader.extract_pdf_text`、`ingest.split_pdf_paragraphs` |
-| pypdf 不可用 / 抽取为空 | 兜底解析：按 latin-1 读原始字节，正则抓 `(...) Tj` 与 `[...] TJ` 文本绘制算子并反转义 | `pdf_reader._raw_parse` |
-| 扫描页 | **不在本项目内跑 OCR**：语料以 OCR 后的文本入库（`.ocr.txt` 或文件名含 `scanned`），切块时打 `metadata.ocr=true`，检索与日志可追踪来源 | `ingest.is_ocr`、`store.chunk_text(ocr=True)` |
+| 文字型 PDF（`hr_policy_bilingual.pdf`，可复制选中） | `pypdf.PdfReader` 逐页 `extract_text()` → `split_pdf_paragraphs()` 按标题行切段（中英混排标题与纯中文短标题均可识别） | `pdf_reader.extract_pdf_text`、`ingest.split_pdf_paragraphs` |
+| 扫描型 PDF（`scanned_leave.pdf`，整页位图、无文字层） | pypdf 抽出文字为空 → 判定扫描件 → 对每页嵌入位图跑 **RapidOCR**（PaddleOCR 模型的 ONNX 版，纯 pip、离线、Apache-2.0），单页 CPU 约 4~5s（仅发生在入库，不在问答链路上） | `pdf_reader.extract_pdf_text`、`scripts/make_scanned_pdf.py` |
 
-也就是说，PDF 的「识别」= 文字层提取（两级），图像 OCR 属上游步骤；换真 OCR 引擎（PaddleOCR / Tesseract）只需产出一个 `.ocr.txt` 放进 `data/`，链路不变。
+- `scanned_leave.pdf` 由 `scripts/make_scanned_pdf.py` 生成：文字渲染成纸面图像 + 歪斜/噪点/模糊，是真正的图片型 PDF（pypdf 读出为空，可用 `python -c` 自验）。
+- `metadata.ocr` 标记来自**真实抽取路径**（`pdf_reader.extract_pdf_text` 返回的 `used_ocr`），不做文件名猜测；检索命中与日志可据此追溯「该答案依据来自扫描件 OCR」。
+- 依赖缺失（无 rapidocr）时显式报错并提示安装，**不做静默兜底**——与 LLM 链路「不静默降级」同一原则。
+- 换 OCR 引擎（PaddleOCR / Tesseract / Docling）只需替换 `pdf_reader.py` 内的 OCR 调用点。
 
 ### 5.2 数据库：嵌入式 Chroma（无独立服务）
 
@@ -169,7 +171,7 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
 3. Rerank 可换 cross-encoder / API rerank（`retrieve.rerank_score` 单函数替换）。
 4. 注入检测可加分类器二次审核；服务可换 FastAPI + 进程管理。
 5. 拒答阈值随 embedding 分布校准（语义 `bge-m3`/`embedding-3`=0.55 判向量余弦；`hash`=0.12 判融合分）；更换 embedding 后须重新校准（校准方法见 `docs/issue_diagnosis.md` 问题五与 `docs/evaluation.md` §2）。
-6. 扫描 PDF 的 OCR 在语料准备阶段完成（见 §5.1），服务侧只消费 OCR 文本。
+6. 扫描 PDF 的 OCR 在入库时自动完成（`pdf_reader.py` 内 RapidOCR，CPU 单页 4~5s，仅离线阶段）；问答链路消费的是 OCR 后文本，不新增延迟。
 7. 默认 embedding 依赖本机 Ollama 服务在跑（装完 Ollama 后台常驻即可，无 GPU 也能跑 bge-m3）；没有 Ollama 时把 `embedding.provider` 设为 `zhipu`（走云端、复用智谱 key）或 `hash`（纯离线词面），改完重跑 `python ingest.py`。
 8. 生成侧只支持云端 OpenAI 兼容端点：本机 `ollama serve` 上 CPU 解码的大模型单请求 30s+，无法满足 90% < 10s 的性能要求（实测见 `docs/issue_diagnosis.md` 问题五），因此不提供本地生成预设。
 
@@ -180,9 +182,9 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
 - **embedding 成本：0**（默认 `ollama bge-m3` 本机推理，无按量计费）。改用云端 `embedding-3` 时计费也极低（45 块语料入库 + 全量评测合计 <¥0.01）。
 - **deepseek-flash 对照数据**（升级 embedding 前实测）：78 次调用均值 528.2 token/次，p50 597ms / p95 2068ms；每 1000 次请求 ≈ 14.0 万 token ≈ ¥0.22（输入 ¥1/M、输出 ¥4/M，高峰 2×）。
 - 成本口径：`token_usage.total_tokens` 均值 × 1000；缓存命中/拒答请求 0 token。切换模型只改 `llm.active`，重跑 `scripts/ops_report.py` 按新模型重算。窗口内（73 次调用、1/3 缓存命中）折算约 **44.8 万 token / 1000 次请求**；冷启动全命中率为 0 时按 588.7 × 1000 ≈ 58.9 万估算 ≈ ¥2.8（输入 ¥1/M、输出 ¥4/M）。
-- **延迟上界保护**：`llm.timeout_seconds=8`（可配置）——单次调用最坏 8s + 一次重试，超时走统一拒答，不会出现「单请求挂 30s 击穿 10s SLA」。
+- **延迟上界保护**：`llm.timeout_seconds=8`（可配置）——瞬时故障（超时/网络/5xx）与坏输出各自动重试一次，仍失败走统一拒答；`reasoning_effort=low` 关闭 glm-5.x 的隐藏推理后，单请求 p95 从 ~4.7s 降至 ~2.5s，90% <10s SLA 余量显著扩大。
 - 权衡：换 7B 级→延迟减半、条款数字转述错误率上升；换 72B 级→质量↑但单实例并发 <5 不达标。
-- 提示词约束（`llm.SYSTEM_PROMPT` v3）：只依据资料原文事实、单段纯文本 ≤150 字、末尾标来源、**用与提问相同的语言作答**。对照实验（`scripts/prompt_experiment.py` → `reports/prompt_experiment.md`）显示 Faithfulness / Style Consistency 显著提升，且真实幻觉（编造数字/条款）会被忠实度口径 + 数字接地检查双重捕获。
+- 提示词约束（`llm.SYSTEM_PROMPT` v5）：只依据资料原文事实、单段纯文本 ≤150 字、末尾标来源、**回答语言与提问一致（英文提问用 English）**。对照实验（`scripts/prompt_experiment.py` → `reports/prompt_experiment.md`）显示 Faithfulness / Style Consistency 显著提升，且真实幻觉（编造数字/条款）会被忠实度口径 + 数字接地检查双重捕获。
 
 <a id="s8"></a>
 ## 8. 交付物清单
@@ -195,7 +197,7 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
 | 日志字段字典与样例 | `docs/log_fields.md`、`logs/rag.jsonl` |
 | 问题诊断 5 个（含证据与 ≥10% 提升） | `docs/issue_diagnosis.md` |
 | 评测方法与指标定义 | `docs/evaluation.md` |
-| 双语 PDF / OCR 链路 | `data/hr_policy_bilingual.pdf`、`data/scanned_leave.ocr.txt`、`scripts/make_bilingual_pdf.py`（说明见 §5） |
+| 双语 PDF / 扫描 PDF（真 OCR）链路 | `data/hr_policy_bilingual.pdf`、`data/scanned_leave.pdf`（图片型扫描件）、`scripts/make_bilingual_pdf.py`、`scripts/make_scanned_pdf.py`（说明见 §5） |
 
 ---
 

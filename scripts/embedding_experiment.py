@@ -31,9 +31,9 @@ def build_chunks():
         path = os.path.join(ingest.DATA_DIR, name)
         if not os.path.isfile(path) or not name.lower().endswith((".txt", ".pdf", ".md")):
             continue
-        text = ingest.read_file(path)
+        text, used_ocr = ingest.read_file(path)
         if text.strip():
-            chunks.extend(store.chunk_text(text, name, ocr=ingest.is_ocr(name)))
+            chunks.extend(store.chunk_text(text, name, ocr=used_ocr))
     return chunks
 
 

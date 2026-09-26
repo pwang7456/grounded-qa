@@ -1,41 +1,52 @@
-"""文字 PDF 抽取：优先 pypdf，无包时解析简单文本算子 (Tj/TJ)。"""
-import re
+"""PDF 抽取：文字型 PDF 走 pypdf 搬运字符；扫描型（无文字层）走 RapidOCR；不静默兜底。"""
+import os
 
 
-def extract_pdf_text(path: str) -> str:
+class PDFExtractionError(Exception):
+    """PDF 无法抽取（依赖缺失 / 无文字层且无嵌入图片）。"""
+
+
+def extract_pdf_text(path: str):
+    """返回 (text, used_ocr)。文字型直接抽取；抽不出文字则按扫描件对嵌入图片做 OCR。"""
     try:
         from pypdf import PdfReader
-    except ImportError:
-        return _raw_parse(path)
+    except ImportError as e:
+        raise PDFExtractionError(
+            f"pypdf 未安装（{e}）；请先 python -m pip install -r requirements.txt")
+
+    reader = PdfReader(path)
+    pages = [(p.extract_text() or "") for p in reader.pages]
+    text = "\n\n".join(pages).strip()
+    if text:
+        return text, False
+
+    # 无文字层 → 判定为扫描件：把每页嵌入的位图交给 OCR（显式依赖，失败即报错）
+    name = os.path.basename(path)
     try:
-        reader = PdfReader(path)
-        pages = [(p.extract_text() or "") for p in reader.pages]
-        text = "\n\n".join(pages).strip()
-        if text:
-            return text
-    except Exception:
-        pass
-    return _raw_parse(path)
+        from rapidocr_onnxruntime import RapidOCR
+        import numpy as np
+    except ImportError as e:
+        raise PDFExtractionError(
+            f"{name} 无文字层（判定为扫描件），需要 OCR 支持："
+            f"python -m pip install rapidocr-onnxruntime（{e}）")
 
-
-_TJ = re.compile(r"\[((?:[^\]\\]|\\.)*)\]\s*TJ", re.S)
-_Tj = re.compile(r"\((?:[^()\\]|\\.)*\)\s*Tj", re.S)
-
-
-def _unescape(s: str) -> str:
-    s = re.sub(r"\\([()\\])", r"\1", s)
-    return re.sub(r"\\[0-7]{1,3}", " ", s)
-
-
-def _raw_parse(path: str) -> str:
-    with open(path, "rb") as f:
-        raw = f.read().decode("latin-1")
+    ocr = RapidOCR()
     out = []
-    for m in _TJ.finditer(raw):
-        parts = re.findall(r"\((?:[^()\\]|\\.)*\)", m.group(1))
-        out.append(_unescape("".join(p[1:-1] for p in parts)))
-    for m in _Tj.finditer(raw):
-        inner = re.match(r"\((.*)\)\s*Tj", m.group(0), re.S)
-        if inner:
-            out.append(_unescape(inner.group(1)))
-    return "\n".join(x for x in out if x.strip())
+    for i, page in enumerate(reader.pages, 1):
+        page_imgs = _page_images(page, name)
+        if not page_imgs:
+            raise PDFExtractionError(
+                f"{name} 第 {i} 页既无文字层也无嵌入图片，无法抽取；"
+                "请先用外部 OCR 工具处理，或换成文字型 PDF")
+        for img in page_imgs:
+            result, _ = ocr(np.array(img.convert("RGB")))
+            if result:
+                out.append("\n".join(line[1] for line in result))
+    return "\n\n".join(x for x in out if x.strip()), True
+
+
+def _page_images(page, name: str):
+    try:
+        return [im.image for im in page.images]
+    except Exception as e:
+        raise PDFExtractionError(f"{name} 读取页面嵌入图片失败：{e}")

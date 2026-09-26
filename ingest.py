@@ -1,4 +1,4 @@
-"""扫描 data/ 入库：txt / pdf / ocr.txt → 分块 → embedding → Chroma。"""
+"""扫描 data/ 入库：txt / pdf(文字型与扫描型) → 分块 → embedding → Chroma。"""
 import json
 import os
 import re
@@ -12,12 +12,16 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 
 
 def _is_heading(line: str) -> bool:
-    return (
-        len(line) <= 40
-        and re.search(r"[A-Za-z]{3,}", line)
-        and not re.search(r"[。;；，,]$", line)
-        and not line.rstrip().endswith(".")
-    )
+    line = line.strip()
+    if not line or len(line) > 40:
+        return False
+    if re.search(r"[。;；，,！？、：:]$", line) or line.endswith("."):
+        return False
+    if re.search(r"[A-Za-z]{3,}", line):
+        return True  # 中英混排标题（如"考勤制度 Attendance"）
+    # 纯中文短行、无任何标点/数字（如"报销政策"）：正文行几乎必然更长或含标点
+    return len(line) <= 12 and not re.search(r"[。;；，,！？、：:()（）\d]", line) \
+        and bool(re.search(r"[一-鿿]", line))
 
 
 def split_pdf_paragraphs(text: str) -> str:
@@ -42,15 +46,13 @@ def split_pdf_paragraphs(text: str) -> str:
     return "\n\n".join(blocks)
 
 
-def read_file(path: str) -> str:
+def read_file(path: str):
+    """返回 (text, ocr_used)。ocr 标记来自真实抽取路径，不做文件名猜测。"""
     if path.lower().endswith(".pdf"):
-        return split_pdf_paragraphs(pdf_reader.extract_pdf_text(path))
+        text, used_ocr = pdf_reader.extract_pdf_text(path)
+        return split_pdf_paragraphs(text), used_ocr
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
-
-
-def is_ocr(filename: str) -> bool:
-    return filename.endswith(".ocr.txt") or "scanned" in filename.lower()
+        return f.read(), False
 
 
 def main():
@@ -62,11 +64,11 @@ def main():
             continue
         if not name.lower().endswith((".txt", ".pdf", ".md")):
             continue
-        text = read_file(path)
+        text, used_ocr = read_file(path)
         if not text.strip():
             print(f"[skip] empty text: {name}", file=sys.stderr)
             continue
-        chunks = store.chunk_text(text, name, ocr=is_ocr(name))
+        chunks = store.chunk_text(text, name, ocr=used_ocr)
         per_file[name] = len(chunks)
         all_chunks.extend(chunks)
     n = store.rebuild_index(all_chunks)

@@ -36,7 +36,7 @@ DEFAULTS = {
     "llm": {
         "active": "zhipu",
         "timeout_seconds": 8,   # 单次调用上限：8s + 重试 1 次仍可控在 10s SLA 口径内
-        "max_tokens": 300,
+        "max_tokens": 400,
         "providers": {
             "deepseek": {
                 "base_url": "https://api.deepseek.com/v1",
@@ -47,6 +47,10 @@ DEFAULTS = {
                 "base_url": "https://open.bigmodel.cn/api/paas/v4",
                 "model": "glm-5.3-flash",
                 "api_key": "",
+                # glm-5.3-flash 始终思考且不支持关闭（API 会拒绝 type=disabled），
+                # 实测默认推理就烧 300+ token、延迟 6~10s；reasoning_effort=low
+                # 把推理 token 压到 0、延迟 1~3s（智谱 OpenAI 兼容参数）
+                "reasoning_effort": "low",
             },
         },
     },
