@@ -1,0 +1,13 @@
+报销制度 Reimbursement Policy
+
+差旅交通费：市内交通实报实销；跨城出差高铁二等座、经济舱机票（提前 3 天预订折扣票）按职级标准执行。差旅津贴每天 150 元（含餐）。Local transport is reimbursed at actual cost; intercity travel is limited to second-class high-speed rail and economy class flights booked 3 days ahead. Daily travel allowance is CNY 150 including meals.
+
+住宿标准：一线城市（北京/上海/深圳/广州）每晚不超过 600 元；其他城市不超过 450 元；双人出行按同性拼房执行。Hotel cap: CNY 600 per night in tier-1 cities (Beijing/Shanghai/Shenzhen/Guangzhou), CNY 450 elsewhere; colleagues of the same gender share rooms.
+
+发票抬头必须为公司全称「某某科技有限公司」，税号 91110108MA01XXXXXX，金额超过 500 元必须提供增值税专用发票。All invoices must be made out to the company's full legal name; VAT special invoices are required above CNY 500.
+
+报销时限：费用发生后 30 个自然日内在费控系统提交，逾期需 CFO 特批。电子发票需上传原件 PDF，纸质发票寄至财务部（北京市海淀区中关村南大街 5 号，收件人：财务共享中心，电话 010-6XXXXXXX）。Submit expenses within 30 calendar days; late claims need CFO approval. Upload original PDF e-invoices; mail paper invoices to the Finance Shared Service Center.
+
+招待费：人均不超过 300 元，需事前在 OA 申请并注明事由与参与人级别。Entertainment expenses must be pre-approved in OA, capped at CNY 300 per person.
+
+小额办公用品（200 元以内）由行政统一采购，员工个人不报销此类费用。Office supplies under CNY 200 are procured centrally and not individually reimbursable.

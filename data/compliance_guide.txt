@@ -1,0 +1,15 @@
+合规指引 Compliance Guide
+
+数据安全：员工不得将客户个人信息（姓名+手机号/身份证/银行卡）导出至个人设备或第三方网盘；测试环境必须使用脱敏数据。Employees must never export customer PII (name + phone / ID / bank card) to personal devices or third-party cloud drives; test environments must use masked data.
+
+利益冲突：员工及其直系亲属持有供应商或竞争对手股份超过 5% 的，须在入职 30 日内及每年年初向合规部申报。Conflicts of interest must be declared to Compliance within 30 days of onboarding and annually if the employee or immediate family holds over 5% equity in a supplier or competitor.
+
+礼品与招待：接受供应商礼品单次不得超过 200 元，年度累计不得超过 1000 元，超出须上交行政部登记。Gifts from vendors are capped at CNY 200 per instance and CNY 1000 per year; excess must be surrendered to Admin.
+
+反商业贿赂：禁止以任何形式向客户提供回扣、返点或虚假发票；违者按《员工奖惩制度》重大违规处理，解除劳动合同并保留追究法律责任的权利。Commercial bribery, kickbacks and false invoicing lead to termination and possible legal action.
+
+举报渠道：合规邮箱 compliance@example.com（24 小时内响应），举报人信息严格保密，禁止任何形式的打击报复。Report violations to compliance@example.com (response within 24h); whistleblower identity is strictly protected.
+
+知识产权：工作期间产出的代码、文档、设计归公司所有；开源引入须通过法务与架构委员会双重评审。Work product belongs to the company; open-source components require Legal and Architecture Board review.
+
+对外发言：未经公关部书面授权，员工不得以公司名义接受媒体采访或在社交平台发布经营数据。Media interviews and disclosure of business data require written PR authorization.

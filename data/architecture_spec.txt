@@ -1,0 +1,13 @@
+技术架构规范 Architecture Specification
+
+微服务通信：内部服务间调用统一使用 gRPC（Proto3 定义放在 platform/api-proto 仓库），对外 HTTP 网关统一由 Kong 承载，禁止服务间绕过网关直连数据库。Internal service-to-service calls must use gRPC (Proto3 in platform/api-proto); north-south traffic goes through the Kong gateway; direct cross-service database access is prohibited.
+
+SLA 与容量：核心读接口 P99 延迟不超过 200ms，可用性目标 99.95%；单实例 QPS 容量按压测报告 80% 水位规划，容量余量低于 30% 触发扩容评审。Core read APIs target P99 under 200ms and 99.95% availability; plan capacity at 80% of load-test-proven QPS with a 30% headroom trigger for scale-out review.
+
+发布流程：所有生产变更走 GitOps（ArgoCD），金丝雀发布 5% → 25% → 100%，每档观察至少 10 分钟错误率与延迟曲线；回滚必须在 3 分钟内完成。All production changes go through GitOps canary 5/25/100 percent with 10-minute observation gates; rollback must complete within 3 minutes.
+
+可观测性：统一 OpenTelemetry SDK 采集 trace，采样率生产 10%、错误与慢调用 100%；日志结构化 JSON 入 ClickHouse，指标入 Prometheus，保留 15/90 天。Use OpenTelemetry with 10% sampling (100% for errors and slow calls); logs to ClickHouse, metrics to Prometheus, retention 15/90 days.
+
+数据安全分级：C3 级以上字段（身份证、银行卡、手机号）存储必须 AES-256 加密并独立密钥（KMS 轮换 90 天），展示默认脱敏。Fields classified C3 or above (ID, bank card, phone) must be AES-256 encrypted with KMS-managed keys rotated every 90 days and masked by default in UI.
+
+缓存规范：读多写少接口接入 Redis 集群，TTL 必须加随机抖动 ±10% 防雪崩；缓存命中率低于 70% 需优化 key 设计。Redis cache TTLs need ±10% jitter to avoid avalanche; hit rates below 70% require key redesign.

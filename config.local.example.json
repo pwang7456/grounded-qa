@@ -1,0 +1,9 @@
+{
+  "llm": {
+    "active": "zhipu",
+    "providers": {
+      "deepseek": { "api_key": "sk-你的DeepSeek密钥" },
+      "zhipu": { "api_key": "你的智谱密钥" }
+    }
+  }
+}

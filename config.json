@@ -1,0 +1,35 @@
+{
+  "retrieval_mode": "hybrid",
+  "rerank_enabled": true,
+  "top_k": 8,
+  "return_k": 3,
+  "refuse_threshold": 0.55,
+  "cache_enabled": true,
+  "cache_ttl_seconds": 600,
+  "max_history_turns": 4,
+  "server_host": "127.0.0.1",
+  "server_port": 8788,
+  "embedding": {
+    "provider": "ollama",
+    "model": "bge-m3",
+    "dimensions": 1024,
+    "base_url": ""
+  },
+  "llm": {
+    "active": "zhipu",
+    "timeout_seconds": 8,
+    "max_tokens": 300,
+    "providers": {
+      "deepseek": {
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-flash",
+        "api_key": ""
+      },
+      "zhipu": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-5.3-flash",
+        "api_key": ""
+      }
+    }
+  }
+}

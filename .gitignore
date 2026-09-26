@@ -1,0 +1,7 @@
+__pycache__/
+cache/answers.json
+logs/
+chroma_data/
+config.local.json
+.idea/
+*.tmp

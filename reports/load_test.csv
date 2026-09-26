@@ -1,0 +1,2 @@
+requests,workers,success,wall_seconds,rps,p50_ms,p95_ms,within_10s_rate,cache_hit_rate,refusal_rate,total_tokens
+60,8,60,7.8,7.65,23,4175,1.0,0.5333,0.1667,29336
