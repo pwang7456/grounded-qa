@@ -3,9 +3,10 @@
 <a id="top"></a>
 <a href="README.md">中文</a> &nbsp;|&nbsp; **English**
 
-A multi-turn RAG QA + generative service built against the AKP take-home brief
-(Asst Manager, Backend Developer): bilingual (CN/EN) knowledge base in **docx / md / txt / text PDF /
-scanned OCR page** — each format is translated into one shared intermediate structure before chunking —,
+**有据 (grounded-qa)** is a multi-turn RAG QA service for internal knowledge bases — it turns
+employee handbooks, policies and engineering specs into an answerable, traceable and measurable
+QA system: bilingual (CN/EN) knowledge base in **docx / md / txt / text PDF /
+scanned PDF (auto-OCR)** — each format is translated into one shared intermediate structure before chunking —,
 semantic embeddings (local Ollama `bge-m3`, zero token cost; switchable to Zhipu
 embedding-3 or an offline hash fallback),
 configurable retrieval (vector / hybrid / +rerank — switched by config, not code),
@@ -24,7 +25,7 @@ structured logs, one-click evaluation and load test, and an ops report.
 | 5 Ingestion & vector store | [§5](README.md#s5) | [§5](#s5) |
 | 6 Limitations | [§6](README.md#s6) | [§6](#s6) |
 | 7 Model choice & cost | [§7](README.md#s7) | [§7](#s7) |
-| 8 Deliverables | [§8](README.md#s8) | [§8](#s8) |
+| 8 Docs & Reports | [§8](README.md#s8) | [§8](#s8) |
 
 <a id="s1"></a>
 ## 1. Quick Start (Windows)
@@ -343,9 +344,9 @@ table degrades into noise); body text is never altered by one character.
   the faithfulness measure plus the numeric-grounding check.
 
 <a id="s8"></a>
-## 8. Deliverables
+## 8. Docs & Reports
 
-| Requirement | Location |
+| Content | Location |
 |---|---|
 | Complete code and configuration | This directory (§2 file table; model/embedding presets in `config.json`, secrets in `config.local.json` — not committed) |
 | One-click evaluation script | `eval.py`, `scripts/load_test.py`, `scripts/ops_report.py` |
@@ -353,7 +354,7 @@ table degrades into noise); body text is never altered by one character.
 | Log field dictionary and sample logs | `docs/log_fields.md`, `logs/rag.jsonl` |
 | Six diagnosed issues (evidence + ≥10% improvement) | `docs/issue_diagnosis.md` |
 | Evaluation method and metric definitions | `docs/evaluation.md` |
-| Bilingual PDF / OCR chain | `data/hr_policy_bilingual.pdf`, `data/scanned_leave.ocr.txt`, `scripts/make_bilingual_pdf.py` (see §5) |
+| Bilingual PDF / scanned PDF (real OCR) chain | `data/hr_policy_bilingual.pdf`, `data/scanned_leave.pdf` (image-only), `scripts/make_bilingual_pdf.py`, `scripts/make_scanned_pdf.py` (see §5.2) |
 | docx / md structured corpus | `data/leave_management_policy.docx` (Word Heading styles + 3-column tables), `data/remote_work_policy.md` (ATX headings + GFM table + fenced block), `scripts/make_structured_docs.py` (regenerates both); rationale in §5.1, attribution in `docs/issue_diagnosis.md` issue 6 |
 
 ---

@@ -3,8 +3,8 @@
 <a id="top"></a>
 **中文** &nbsp;|&nbsp; <a href="README.en.md">English</a>
 
-对照 take-home（Asst Manager, Backend Developer, AKP）实现的多轮 RAG 问答 + 生成服务：
-中英双语知识库（**docx / md / txt / 文字 PDF / 扫描 OCR 页**，四种格式统一翻译成同一种中间结构后切块）、语义 embedding（本机 Ollama `bge-m3`，零 token 成本；可切云端智谱 embedding-3 或离线 hash 兜底）、
+**有据（grounded-qa）**：面向企业内部知识库的多轮 RAG 问答服务——把员工手册、制度文档、技术规范变成可提问、可溯源、可评测的问答系统：
+中英双语知识库（**docx / md / txt / 文字 PDF / 扫描 PDF 自动 OCR**，四种格式统一翻译成同一种中间结构后切块）、语义 embedding（本机 Ollama `bge-m3`，零 token 成本；可切云端智谱 embedding-3 或离线 hash 兜底）、
 可配置检索（vector / hybrid / +rerank，改配置不改代码）、
 三类拒答（注入 / 越界 / 低置信）＋模型自述资料不足识别、数字接地校验、PII 脱敏、答案缓存、结构化日志、一键评测与压测、运维报表。
 
@@ -19,7 +19,7 @@
 | 5 知识库摄入与数据库 Ingestion & store | [§5](#s5) | [§5](README.en.md#s5) |
 | 6 限制 Limitations | [§6](#s6) | [§6](README.en.md#s6) |
 | 7 模型与成本 Model & cost | [§7](#s7) | [§7](README.en.md#s7) |
-| 8 交付物 Deliverables | [§8](#s8) | [§8](README.en.md#s8) |
+| 8 文档与报告索引 Docs & Reports | [§8](#s8) | [§8](README.en.md#s8) |
 
 <a id="s1"></a>
 ## 1. 快速开始（Windows）
@@ -145,7 +145,7 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
 
 - **拒答闭环**：注入 / 越界 / 低置信 / 模型自述资料不足 四类拒答统一走 `refused=true` 且不写缓存；`provider` 后缀（`+insufficient` / `+unavailable`）与日志 `llm_error` 字段可区分「模型没接好」与「检索没命中」。低置信阈值始终作用在 rerank **之前**的分数（语义 embedding 用向量余弦 `top_v_score`，`hash` 用融合分 `top_raw_score`），rerank 开关不影响拒答口径。
 - **数字接地**：`numeric_grounded` 硬校验答案数字全部来自检索资料，补足词面忠实度抓不住「15 天说成 25 天」的盲区（只标记不拒答，纳入合规分）。
-- **规则级注入防护 + 越界词表**：作业演示级，已知变体可绕过；扩展路线见 §6。
+- **规则级注入防护 + 越界词表**：演示级基线，已知变体可绕过；扩展路线见 §6。
 
 <a id="s5"></a>
 ## 5. 知识库摄入与向量数据库
@@ -220,9 +220,9 @@ store.chunk_blocks()   ← 只认 Block，不认识任何文件格式扩展名
 - 提示词约束（`llm.SYSTEM_PROMPT` v5）：只依据资料原文事实、单段纯文本 ≤150 字、末尾标来源、**回答语言与提问一致（英文提问用 English）**。对照实验（`scripts/prompt_experiment.py` → `reports/prompt_experiment.md`）显示 Faithfulness / Style Consistency 显著提升，且真实幻觉（编造数字/条款）会被忠实度口径 + 数字接地检查双重捕获。
 
 <a id="s8"></a>
-## 8. 交付物清单
+## 8. 文档与报告索引
 
-| 要求 | 位置 |
+| 内容 | 位置 |
 |---|---|
 | 完整代码与配置 | 本目录（§2 文件表；模型/embedding 预设见 `config.json`，密钥在 `config.local.json`，不入库） |
 | 一键评测脚本 | `eval.py`、`scripts/load_test.py`、`scripts/ops_report.py` |

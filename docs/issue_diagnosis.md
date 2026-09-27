@@ -137,7 +137,7 @@
 | Context Precision（hybrid+rerank） | 0.975 | **1.000** | +2.6% |
 | embedding 单价 | 云端 API 计费 | **0**（本机 1.2GB 模型） | 每 1000 次调用省掉全部 embedding 开销 |
 
-**同一实验的附带结论（已据此定案）**：本地生成不可用于本作业的 SLA 口径——本机 `ollama` 跑 `qwen3:30b-a3b`，`ollama ps` 显示 19GB 权重 **100% CPU**，单请求实测 32.7s / 33.2s（是 p95 目标 10s 的 3 倍），且关掉思考链后仍在 `content` 里输出「首先，用户的问题是…」式元叙述，Faithfulness 掉到 0.458~0.607。`llm.providers` 只留 `deepseek` / `zhipu` 两个云端 flash 预设（临时验证时曾加过 `ollama` 生成预设，实测不达标后已移除），本地模型只用于 embedding（bge-m3 单次查询百毫秒级、与生成不在一个量级）。
+**同一实验的附带结论（已据此定案）**：本地生成不可用于本项目的 SLA 口径——本机 `ollama` 跑 `qwen3:30b-a3b`，`ollama ps` 显示 19GB 权重 **100% CPU**，单请求实测 32.7s / 33.2s（是 p95 目标 10s 的 3 倍），且关掉思考链后仍在 `content` 里输出「首先，用户的问题是…」式元叙述，Faithfulness 掉到 0.458~0.607。`llm.providers` 只留 `deepseek` / `zhipu` 两个云端 flash 预设（临时验证时曾加过 `ollama` 生成预设，实测不达标后已移除），本地模型只用于 embedding（bge-m3 单次查询百毫秒级、与生成不在一个量级）。
 
 复现：`python scripts/embedding_experiment.py`（结束自动把索引恢复为当前配置的 embedding）；`logs/rag.jsonl` 中 `provider=ollama` 的两条 `local-probe` 事件即上表延迟与忠实度证据。
 
