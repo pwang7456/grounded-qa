@@ -1,7 +1,8 @@
 # 评测方法与指标定义
 
 一键评测：`python eval.py`（无需先启动服务，直接进程内跑全流水线；评测自动关闭缓存，保证可复现）。
-评测集：`eval/questions.jsonl`，20 个应答题（中英双语、覆盖 6 个知识文件，含文字 PDF 与扫描型 PDF（入库时 RapidOCR 真实识别））+ 10 个应拒答题（越界 o01-o05 / 注入 i01-i04 / 低置信 l01）。
+评测集：`eval/questions.jsonl`，37 个应答题（中英双语、覆盖 8 个知识文件：4 份 txt、2 份 PDF（文字型 + 扫描型，后者入库时 RapidOCR 真实识别）、1 份带 Heading 样式与表格的 docx、1 份带 `#` 层级与 GFM 表格的 md）+ 12 个应拒答题（越界 o01-o05 / 注入 i01-i04 / 低置信 l01、o06、o07——后两道是「主题在库里根本没有」的题，只能靠置信度而不是词表拦下）。
+金标口径：应答题用 `gold_contains` 关键句**正文子串**精确匹配；因此切块器给 chunk 加标题前缀时必须保证「只增正文、不改正文」，否则金标会假性失配（见 `docs/issue_diagnosis.md` 问题六）。
 
 ## 1. 检索指标（三配置对比：vector / hybrid / hybrid+rerank）
 
@@ -28,6 +29,6 @@
 - 运维报表：`python scripts/ops_report.py [N]` 从 `logs/rag.jsonl` 聚合 p50/p95、token 用量（含每 1000 次调用估算）、缓存命中、拒答率、答案合规率。给 N 时只统计最后 N 条（当前代码/配置口径那段日志），默认全量。
 - Token 成本口径：`token_usage.total_tokens` 均值 × 1000 = 每 1000 次调用 token 量。当前实测（`zhipu glm-5.3-flash` + 本机 bge-m3，`reports/ops_report.md` 取最后 96 条请求 / 73 次真实调用）：**588.7 token/次**（prompt 462.6 + completion 126.2），窗口内含 1/3 缓存命中折算 **44.8 万 token / 1000 次**（冷启动约 58.9 万）。历史对照（`deepseek-flash`，embedding 升级前 78 次调用）：528.2 token/次、14.0 万 token/1000 次 ≈ ¥0.22（牌价输入 ¥1/M、输出 ¥4/M，工作日高峰 2×）。切换模型只改 `config.json` 的 `llm.active`（内置 deepseek / zhipu 预设），重跑本报表即按新模型计价。模型选型理由见 README §7。
 
-## 4. 诊断复现（before/after ≥10% 提升）
+## 4. 诊断复现（before/after 量化对比；问题六为能力扩展 + 归因，不含 ≥10% 提升）
 
-五个问题的复现步骤与数据见 `docs/issue_diagnosis.md`：拒答阈值误配（`scripts/threshold_experiment.py`）、提示词约束对生成质量的影响（`scripts/prompt_experiment.py`）、多轮改写稀释（HTTP 实测 + 日志回放）、embedding 换语义（`docs/issue_diagnosis.md` 问题四）、低置信门禁随 embedding 分流 + 本地 bge-m3（`scripts/embedding_experiment.py`），均基于 `logs/rag.jsonl` 与脚本实测复现。
+六个问题的复现步骤与数据见 `docs/issue_diagnosis.md`：拒答阈值误配（`scripts/threshold_experiment.py`）、提示词约束对生成质量的影响（`scripts/prompt_experiment.py`）、多轮改写稀释（HTTP 实测 + 日志回放）、embedding 换语义（`docs/issue_diagnosis.md` 问题四）、低置信门禁随 embedding 分流 + 本地 bge-m3（`scripts/embedding_experiment.py`）、多格式接入与统一 Block 切块（`scripts/make_structured_docs.py` + 分组归因/消融，见问题六），均基于 `logs/rag.jsonl` 与脚本实测复现。

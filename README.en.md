@@ -4,8 +4,9 @@
 <a href="README.md">中文</a> &nbsp;|&nbsp; **English**
 
 A multi-turn RAG QA + generative service built against the AKP take-home brief
-(Asst Manager, Backend Developer): bilingual (CN/EN) knowledge base including a text PDF and a
-scanned/OCR page, semantic embeddings (local Ollama `bge-m3`, zero token cost; switchable to Zhipu
+(Asst Manager, Backend Developer): bilingual (CN/EN) knowledge base in **docx / md / txt / text PDF /
+scanned OCR page** — each format is translated into one shared intermediate structure before chunking —,
+semantic embeddings (local Ollama `bge-m3`, zero token cost; switchable to Zhipu
 embedding-3 or an offline hash fallback),
 configurable retrieval (vector / hybrid / +rerank — switched by config, not code),
 three refusal classes (injection / out-of-scope / low confidence) plus model-declared
@@ -47,7 +48,7 @@ work immediately. The page offers:
 - **Status chips** in the header showing the live `llm.active` model, embedding signature and chunk count.
   "新会话" (new session) mints a fresh `session_id`, dropping multi-turn context.
 
-> Requirements: `chromadb`, `pypdf`, `reportlab`, `rapidocr-onnxruntime`, `pillow` (`python -m pip install -r requirements.txt`).
+> Requirements: `chromadb`, `pypdf`, `python-docx`, `reportlab`, `rapidocr-onnxruntime`, `pillow` (`python -m pip install -r requirements.txt`).
 
 ### LLM & embedding configuration (config.json + config.local.json, layered)
 
@@ -99,6 +100,7 @@ python scripts\smoke_test.py                &REM smoke test (8 in-process scenar
 python scripts\prompt_experiment.py         &REM prompt A/B -> reports/prompt_experiment.md
 python scripts\threshold_experiment.py      &REM refusal-threshold A/B -> reports/threshold_experiment.md
 python scripts\embedding_experiment.py      &REM embedding A/B -> reports/embedding_experiment.md
+python scripts\make_structured_docs.py      &REM generate the docx / md corpus with real Heading styles and tables
 ```
 
 <a id="s2"></a>
@@ -111,7 +113,9 @@ POST /api/ask {q, session_id, retrieval_mode?, rerank_enabled?}
       -> retrieve (vector | hybrid [+rerank]) -> low-score refusal (vector cosine on semantic embeddings / pre-rerank fusion score on hash)
       -> llm (DeepSeek / Zhipu GLM, OpenAI-compatible) -> insufficient-context detection / numeric grounding / PII redaction
       -> logging, caching, session update
-Data plane: data/*.(txt|pdf) -> ingest.py + pdf_reader.py (text PDF via pypdf; scanned PDF auto-RapidOCR) -> store (chunking + ollama bge-m3 | zhipu embedding-3 | hash) -> Chroma (chroma_data/)
+Data plane: data/*.(docx|md|txt|pdf) -> per-format readers translate each format into a unified Block (heading|paragraph|table)
+        -> ingest.py dispatches by file extension (unsupported extensions print an explicit [skip] with the reason) -> store.chunk_blocks (heading stack + context prefix)
+        -> embedding (ollama bge-m3 | zhipu embedding-3 | hash) -> Chroma (chroma_data/)
 ```
 
 | File | Responsibility |
@@ -119,12 +123,17 @@ Data plane: data/*.(txt|pdf) -> ingest.py + pdf_reader.py (text PDF via pypdf; s
 | `app.py` | HTTP: `/api/ask` `/api/health` `/api/config` + static page |
 | `pipeline.py` | Main orchestration (safety → cache → retrieval → generation → logging); low-confidence refusal: `top_v_score` (vector cosine) on semantic embeddings, pre-rerank fusion score on `hash`; numeric-grounding check `numeric_grounded` |
 | `settings.py` | Config loading: `config.json` (template) + `config.local.json` (secrets, gitignored), deep-merged, hot-read |
-| `store.py` | Chunking; pluggable embeddings (`OpenAICompatEmbeddingFunction` semantic — local Ollama bge-m3 / cloud Zhipu embedding-3; `LocalHashEmbeddingFunction` offline lexical fallback); collection fingerprint check; embedded Chroma |
-| `retrieve.py` | Vector / BM25(k1=1.5,b=0.75, inverted stats cached per corpus) fusion `0.55v+0.45b` / light rerank `0.55s+0.35cover+0.10phrase` (keeps `raw_score` for threshold gating) |
+| `store.py` | **Chunker `chunk_blocks()` (knows only Blocks, no file formats)**: heading-stack assembly + nearest-heading prefix (60-char budget) + >400-char splits at sentence endings (50-char overlap) + table blocks never split across chunks; `CHUNKER_VERSION` participates in the cache salt; pluggable embeddings (`OpenAICompatEmbeddingFunction` semantic — local Ollama bge-m3 / cloud Zhipu embedding-3; `LocalHashEmbeddingFunction` offline lexical fallback); collection fingerprint check; embedded Chroma |
+| `blocks.py` | **The intermediate-structure contract**: `{"type": "heading"\|"paragraph"\|"table", "level": 1~6, "text": ...}` + `table_from_rows()` flattening each table row into `column:value \| column:value` key-value lines (every row carries its column names, so a hit needs no look-back at the header) |
+| `ingest.py` | Dispatches by file extension to the readers and returns `(chunks, per_file, skipped, failed)`; unsupported formats print `[skip] unsupported: file (reason)`, extraction failures print `[fail]` and `exit 1` — never a silently missing document |
+| `docx_reader.py` | docx → Block: iterates `document.element.body` children in order (`doc.paragraphs` and `doc.tables` are two separate lists — using them directly loses the interleaving); heading level taken from the style name |
+| `md_reader.py` | md → Block: a line state machine (ATX headings / fenced code / pipe tables / blank-line paragraph breaks); the GFM `|---|` separator row is skipped without triggering a flush; zero new dependencies |
+| `text_reader.py` | txt / pdf → Block: pypdf extraction, then sections split on heading lines; here `_is_heading` is **demoted to a fallback for structure-less sources only** (no longer part of the chunking logic), with `SECTION_MARK_RE` added for long bilingual chapter headings |
+| `retrieve.py` | Vector / BM25(k1=1.5,b=0.75, inverted stats cached per corpus) fusion `0.55v+0.45b` / light rerank `0.55s+0.35cover+0.10phrase` (cover/phrase computed on the body only, `prefix_len` strips the heading-path prefix; keeps `raw_score` for threshold gating) |
 | `llm.py` | Preset resolution (`llm.active`), OpenAI-compatible HTTP (timeout/max-tokens configurable, default 8s/400; a preset may override `timeout_seconds` / `reasoning_effort` — Zhipu glm-5.x always thinks, `low` cuts reasoning tokens from 300+ to 0), CoT stripping `strip_thinking`, `finish_reason=length` truncation detection, one auto-retry each for unusable output and transient failures (timeout/network/5xx), then refusal; insufficient-context detection (`+insufficient`); prompt version in the cache key |
 | `sessions.py` | In-memory multi-turn + cue-gated rewrite + TTL eviction (only concatenates the last 2 questions when anaphora/continuation cues exist, so independent questions are not diluted) |
 | `safety.py` | CN/EN injection regexes, out-of-scope keywords, PII redaction (phone/email/ID/bank card) |
-| `cache.py` | `sha256(q+mode+rerank)` disk cache, TTL 600s by default, bad answers never replayed |
+| `cache.py` | `sha256(question + retrieval mode + rerank + model/prompt version + CHUNKER_VERSION)` disk cache, TTL 600s by default, bad answers never replayed |
 | `pdf_reader.py` | PDF extraction: text PDFs via pypdf; no text layer → scanned → RapidOCR on the embedded bitmaps (explicit dependency, errors loudly, no silent fallback); returns `(text, used_ocr)` for `metadata.ocr=true` |
 | `eval.py` / `scripts/load_test.py` / `scripts/ops_report.py` | One-click evaluation / load test / ops report |
 
@@ -149,9 +158,10 @@ Data plane: data/*.(txt|pdf) -> ingest.py + pdf_reader.py (text PDF via pypdf; s
 template; secrets live only in local). `app.py` calls `load_config()` per request, so edits apply
 immediately; `/api/config` shows the live config with `api_key` masked.
 
-Answer cache key = `sha256(question + retrieval mode + rerank + llm.cache_salt())`, where the salt
-covers `provider|model|prompt version`: switching models or editing the prompt invalidates stale
-cache automatically, and answers where the model declares insufficient context are never cached.
+Answer cache key = `sha256(question + retrieval mode + rerank + llm.cache_salt() + "chunk" + store.CHUNKER_VERSION)`, where the salt
+covers `provider|model|prompt version` and the chunker version participates separately: switching models, editing the prompt
+**or changing the chunking** invalidates stale cache automatically, so an answer built on old chunks can never masquerade as
+the new retrieval quality. Answers where the model declares insufficient context are never cached.
 
 `retrieval_mode` / `rerank_enabled` in the request body temporarily override global config.
 
@@ -169,11 +179,15 @@ cache automatically, and answers where the model declares insufficient context a
   low-confidence gate now reads the vector cosine (`top_v_score`; answerable minimum 0.600 vs
   refuse-worthy maximum 0.495 → threshold 0.55), `hash` keeps the fusion score. Before the fix only
   1 of 10 refuse-worthy questions was caught by confidence; afterwards 10 of 10 (issue 5).
-- **hybrid by default**: with bge-m3 all three configs now score 1.000 on this evaluation set
-  (`reports/eval_report.md` §1); hybrid stays the default for redundancy — BM25 exact-term recall
-  backstops clause questions ("15 days", "after 3 months of service"), which is exactly what the
-  hash-era gap proved (vector-only 0.842 vs hybrid 0.967). If the embedding gets weaker or the corpus
-  grows, hybrid is the config that does not fall over.
+- **hybrid by default**: on the expanded 49-question benchmark (docx/md corpus, questions written
+  independently of the documents) the three configs score CP 0.892 / 0.892 / 0.896
+  (`reports/eval_report.md` §1) — the hybrid/rerank advantage over vector-only has narrowed from the
+  hash-era gap (0.842 vs 0.967) to ±0.005; hybrid+rerank stays the default as **redundancy** — BM25
+  exact-term recall backstops clause questions ("15 days", "after 3 months of service"), and hybrid is
+  the config that does not fall over if the embedding gets weaker or the corpus grows. **Rerank's
+  token cover is computed on the body only** (`prefix_len` strips the heading-path prefix) — counting
+  prefix words inflated same-section chunks and biased ranking toward "title looks like the question"
+  (measured CP 0.883 before the fix, 0.896 after).
 - **Refusal loop**: all four refusal classes (injection / out-of-scope / low confidence / model-declared
   insufficiency) return `refused=true` and skip the cache; the `provider` suffix
   (`+insufficient` / `+unavailable`) plus the `llm_error` log field distinguish "model not connected"
@@ -189,11 +203,45 @@ cache automatically, and answers where the model declares insufficient context a
 <a id="s5"></a>
 ## 5. Knowledge-base ingestion and the vector store
 
-### 5.1 Two paths: text PDF vs scanned PDF
+### 5.1 The unified Block intermediate structure: a new format = a new translator
+
+Real policy documents live in Word and Markdown, not txt. If the chunker faced formats directly, every
+new format meant editing the chunker and re-running the whole evaluation. So a contract layer sits in the
+middle of the pipeline:
+
+```
+docx_reader / md_reader / text_reader(txt) / text_reader(pdf -> pypdf or RapidOCR)
+        ↓ all return List[Block], Block = {"type": "heading"|"paragraph"|"table", "level": 1~6, "text": "..."}
+store.chunk_blocks()   ← knows only Blocks, no file-format extensions
+        ↓ chunk = nearest-heading prefix + verbatim body text, metadata carries heading_path / block_type / ocr / language
+```
+
+| Format | How structure becomes a Block | Knowingly lost (not hidden) |
+|---|---|---|
+| `.docx` | Iterates `document.element.body` children in order; heading level taken from the style name `Heading N / 标题 N`; each table row flattened into `column:value \| column:value` | **Text boxes and in-image text are unreadable**; merged cells are read out repeatedly per span (shows up as duplicated column names); the legacy binary `.doc` is unsupported — ingest explicitly asks to "save as .docx" first |
+| `.md` | ATX headings `#{1,6}` → level; a fenced code block becomes one paragraph Block; pipe tables → table Blocks; blank lines are only paragraph separators, no longer chunk boundaries | No HTML tags or YAML front-matter parsing; a bullet list is merged into one paragraph Block (per-item chunking would strip each item of context); inline styles (quote/italic) keep only the raw characters |
+| `.txt` | Blank lines split paragraphs; short lines are heuristically treated as headings | No real style information at all — headings can only be guessed (see below) |
+| `.pdf` | Text PDF: pypdf character extraction → sections split on heading lines; scanned pages: the RapidOCR result goes through the same path | A PDF carries coordinates and font sizes but no semantics — the heading level is always inferred; multi-column layouts may interleave |
+
+`_is_heading` (guessing a heading from line length + punctuation) is **demoted** by this redesign to a
+fallback for structure-less sources only, serving just txt and pypdf — docx/md carry real styles and
+should never go through guessing again. `SECTION_MARK_RE` was added to recognize long bilingual chapter
+headings such as `第三章 婚假与产假 Chapter 3 Marriage and Maternity Leave` (the old implementation capped
+heading lines at 40 characters and structurally missed them). The chunking impact and the quantified
+attribution of the three new defects this exposed are in `docs/issue_diagnosis.md` issue 6.
+
+Chunking rules (`store.chunk_blocks`, `CHUNKER_VERSION=v2`): headings pop the stack by level and skipped
+levels are tolerated; each chunk is prefixed with its **nearest heading** (60-char budget — the document-wide
+H1 does not enter every chunk, otherwise its words pollute the BM25 bag of every block), the full path is
+kept in `metadata.heading_path`; chunks over 400 characters split at sentence boundaries with a 50-character
+overlap; **table Blocks are never split across chunks** (once split, cells lose their column names and the
+table degrades into noise); body text is never altered by one character.
+
+### 5.2 Two paths: text PDF vs scanned PDF
 
 | Corpus | Path | Code |
 |---|---|---|
-| Text PDF (`hr_policy_bilingual.pdf`, selectable text) | `pypdf.PdfReader` → per-page `extract_text()`, then `split_pdf_paragraphs()` breaks sections on heading lines (both CN/EN-mixed and pure-Chinese short headings are recognized) | `pdf_reader.extract_pdf_text`, `ingest.split_pdf_paragraphs` |
+| Text PDF (`hr_policy_bilingual.pdf`, selectable text) | `pypdf.PdfReader` → per-page `extract_text()`, then `split_pdf_paragraphs()` breaks sections on heading lines (both CN/EN-mixed and pure-Chinese short headings are recognized) | `pdf_reader.extract_pdf_text`, `text_reader.split_pdf_paragraphs` |
 | Scanned PDF (`scanned_leave.pdf`, full-page bitmap, no text layer) | pypdf extracts nothing → classified as scanned → **RapidOCR** runs on each page's embedded bitmap (ONNX build of PaddleOCR models: pure pip, offline, Apache-2.0), ~4–5s per page on CPU — ingest-time only, never on the QA path | `pdf_reader.extract_pdf_text`, `scripts/make_scanned_pdf.py` |
 
 - `scanned_leave.pdf` is generated by `scripts/make_scanned_pdf.py`: text rendered onto a paper-like
@@ -206,7 +254,7 @@ cache automatically, and answers where the model declares insufficient context a
 - Swapping OCR engines (PaddleOCR / Tesseract / Docling) only touches the OCR call site in
   `pdf_reader.py`.
 
-### 5.2 Database: embedded Chroma (no separate server)
+### 5.3 Database: embedded Chroma (no separate server)
 
 - **Instance**: `chromadb.PersistentClient(path="chroma_data/")`, called in-process — no Docker, no DB service.
 - **On disk**: `chroma_data/chroma.sqlite3` holds collection metadata, documents, ids and the HNSW
@@ -250,6 +298,17 @@ cache automatically, and answers where the model declares insufficient context a
 8. Generation only supports cloud OpenAI-compatible endpoints: a CPU-only local model takes 30s+ per
    request and cannot meet the 90%-under-10s requirement (measurement in
    `docs/issue_diagnosis.md` issue 5), so no local generation preset is offered.
+9. The format readers cover docx / md / txt / pdf; `.pptx` / `.xlsx` / images / `.doc` are not wired in,
+   but ingest reports them explicitly via `[skip] unsupported: file (reason)` and lists them under
+   `skipped_unsupported` in the report — never a silently missing document. Adding a format only means a
+   reader returning `List[Block]` registered in `ingest.READERS`; the chunker and everything downstream
+   stay untouched.
+10. The heading prefix is a double-edged sword: it gives chunks context but also injects heading words
+    into sibling chunks' BM25 bag, measured as pushing `q06` (maternity leave) out of top1
+    (`docs/issue_diagnosis.md` issue 6). In the same unfixed class: the BM25 min-max baseline drifting
+    with corpus size, which mis-orders `q08`, and — on cross-lingual queries — the BM25 leg actively
+    demoting the correct chunk, so English questions score better in vector-only mode. All three are
+    quantified with ablation evidence and deliberately left unfixed under the "diagnose first" rule.
 
 <a id="s7"></a>
 ## 7. Model selection and cost
@@ -259,11 +318,13 @@ cache automatically, and answers where the model declares insufficient context a
   `reports/ops_report.md`): mean 588.7 tokens/call, p50 4ms (a third of requests hit the cache) /
   p95 4692ms / p99 5726ms, **100% within 10s**, mean faithfulness 0.9675, numeric-grounding 1.0,
   answer compliance 1.0. The 8-worker load test (60 requests, `reports/load_test.csv`): 100% success,
-  p50 23ms / p95 4175ms, 7.65 RPS. All 30 evaluation questions pass every metric
-  (`reports/eval_report.md`; retrieval 1.000/1.000/1.000 across the three configs). Switching
-  generation to `deepseek` is one config key (both keys are pre-configured locally).
+  p50 23ms / p95 4175ms, 7.65 RPS. All metrics pass on the 49-question evaluation
+  (`reports/eval_report.md`: Context Precision 0.892 / 0.892 / 0.883 across the three configs,
+  Faithfulness 0.929, Compliance 0.987, Refusal 1.000, Style 0.973; the pre-change 30-question baseline
+  is in `reports/baseline_before_format.md`, per-question attribution in `docs/issue_diagnosis.md` issue 6).
+  Switching generation to `deepseek` is one config key (both keys are pre-configured locally).
 - **Embedding cost: 0** (the default `ollama bge-m3` runs locally, nothing is metered). Cloud
-  `embedding-3` is negligible too (<¥0.01 for the full 45-chunk ingest plus every evaluation call).
+  `embedding-3` is negligible too (<¥0.01 for the full 57-chunk ingest plus every evaluation call).
 - **deepseek-flash reference** (measured before the embedding upgrade): 78 calls, mean 528.2
   tokens/call, p50 597ms / p95 2068ms; per 1,000 requests ≈ 140k tokens ≈ ¥0.22 at flash list pricing
   (¥1/M input, ¥4/M output; weekday peak capped at 2×).
@@ -290,9 +351,10 @@ cache automatically, and answers where the model declares insufficient context a
 | One-click evaluation script | `eval.py`, `scripts/load_test.py`, `scripts/ops_report.py` |
 | Evaluation report with before/after comparisons | `reports/eval_report.md`, `reports/eval_metrics.csv`, `reports/ops_report.md`, `reports/load_test.csv`, `reports/prompt_experiment.md`, `reports/threshold_experiment.md`, `reports/embedding_experiment.md` |
 | Log field dictionary and sample logs | `docs/log_fields.md`, `logs/rag.jsonl` |
-| Five diagnosed issues (evidence + ≥10% improvement) | `docs/issue_diagnosis.md` |
+| Six diagnosed issues (evidence + ≥10% improvement) | `docs/issue_diagnosis.md` |
 | Evaluation method and metric definitions | `docs/evaluation.md` |
 | Bilingual PDF / OCR chain | `data/hr_policy_bilingual.pdf`, `data/scanned_leave.ocr.txt`, `scripts/make_bilingual_pdf.py` (see §5) |
+| docx / md structured corpus | `data/leave_management_policy.docx` (Word Heading styles + 3-column tables), `data/remote_work_policy.md` (ATX headings + GFM table + fenced block), `scripts/make_structured_docs.py` (regenerates both); rationale in §5.1, attribution in `docs/issue_diagnosis.md` issue 6 |
 
 ---
 

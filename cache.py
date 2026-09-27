@@ -53,9 +53,3 @@ def put(key: str, value: dict):
             keep = sorted(data.items(), key=lambda kv: kv[1].get("created_at", 0))[-500:]
             data = dict(keep)
         _save(data)
-
-
-def stats() -> dict:
-    with _lock:
-        data = _load()
-        return {"entries": len(data)}

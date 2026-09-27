@@ -6,7 +6,6 @@
 import csv
 import json
 import os
-import statistics
 import sys
 import threading
 import time

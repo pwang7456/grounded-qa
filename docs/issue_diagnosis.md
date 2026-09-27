@@ -2,6 +2,7 @@
 
 每条问题均含：现象与日志/指标证据 → 根因分析 → 修复思路 → 修复后量化提升（≥10%）。
 证据可在 `logs/rag.jsonl` 用 `request_id` grep 复现。
+例外：问题六是能力扩展（多格式接入），它的量化部分是「指标变化的分组归因 + 本次改造自己引入的三个缺陷」，那三条按「先诊断」口径只记录未修，不包装成提升。
 
 ---
 
@@ -139,3 +140,81 @@
 **同一实验的附带结论（已据此定案）**：本地生成不可用于本作业的 SLA 口径——本机 `ollama` 跑 `qwen3:30b-a3b`，`ollama ps` 显示 19GB 权重 **100% CPU**，单请求实测 32.7s / 33.2s（是 p95 目标 10s 的 3 倍），且关掉思考链后仍在 `content` 里输出「首先，用户的问题是…」式元叙述，Faithfulness 掉到 0.458~0.607。`llm.providers` 只留 `deepseek` / `zhipu` 两个云端 flash 预设（临时验证时曾加过 `ollama` 生成预设，实测不达标后已移除），本地模型只用于 embedding（bge-m3 单次查询百毫秒级、与生成不在一个量级）。
 
 复现：`python scripts/embedding_experiment.py`（结束自动把索引恢复为当前配置的 embedding）；`logs/rag.jsonl` 中 `provider=ollama` 的两条 `local-probe` 事件即上表延迟与忠实度证据。
+
+---
+
+## 问题六：知识库只有 txt/pdf，结构在入口处就被压平 → 统一中间结构 Block 改造
+
+**现象**：改造前 data/ 只有 6 份资料——4 份我手写的 txt + 2 份 pdf（其中 1 份扫描件），而真实企业制度的载体是 Word 和 Markdown。旧链路只有「字符流」概念：`ingest.read_file()` 把任何文件读成 str，`store.chunk_text()` 只认空行分段 + `_is_heading()` 按行长和标点猜标题。后果有三个：
+
+1. docx 的 Heading 样式层级、md 的 `#` 层级、Word 表格的行列关系，全部在入口就被压成一维字符串，切块器拿不到；
+2. `if len(body) < 10: continue` 把短条目静默丢掉（「本条与上一条一致」这类条款直接消失，且不报错）；
+3. 未识别扩展名走 `continue` 静默跳过——往 data/ 放一份 `.docx`，入库报告照样「成功」，但少一份资料，没人知道。
+
+真正的成本不是「支持的格式少」，而是**切块逻辑与解析逻辑耦合**：每加一种格式就要动一次切块器，动一次就要重跑全量评测。
+
+**修复思路**：不让切块器认识格式，而是让每种格式先翻译成同一种中间结构。新增 `blocks.py` 定义 Block 契约 `{"type": "heading"|"paragraph"|"table", "level": 1~6（非标题为 0）, "text": "..."}`，所有 reader 返回 `List[Block]`，`store.chunk_blocks()` 只消费 Block。此后新增格式 = 新增一个翻译器，下游零改动。
+
+1. `blocks.py`：`make_block()` 统一校验 + `heading()/paragraph()/table()` 三个构造器，`table_from_rows(header, rows)` 把表格展平成 `列名:值 | 列名:值` 的键值行——每行自带列名，检索命中后不必回看表头行；表头缺失或列数不符时用「列N」兜底，保证键永远存在。
+2. `docx_reader.py`：按 `doc.element.body.iterchildren()` 顺序遍历。不能用 `doc.paragraphs` / `doc.tables`——它们是两个独立列表，分别取会丢掉段落与表格的交错顺序，所有表格会被排到文末。标题级别从 `para.style.name` 用 `(?:Heading|heading|标题)\s*(\d)` 提取，样式名读取包 try/except（一份损坏样式不该让整份文档入库失败）。
+3. `md_reader.py`：行状态机，不引新库。**踩到的坑**：GFM 表格的 `|---|---|` 对齐行若按普通分支处理，会先触发 `flush_table()`，把刚收到的表头行当成「无数据的空表」丢掉，于是整张表列名错位一行。修正为分隔行只 `continue` 不 flush。空行只作段落分隔符，不再是 chunk 边界；未闭合代码围栏照常入库，不静默丢。
+4. `text_reader.py`：txt / pdf 收编为段落 Block；`_is_heading` 从「切块逻辑的一部分」降级为「无结构来源的专用兜底」，并补 `SECTION_MARK_RE`——`第三章 婚假与产假 Chapter 3 Marriage and Maternity Leave` 有 48 字，被旧 `len(line) > 40` 判成非标题（双语章节标题天然长，这是规则猜测的天花板，也是该函数该被降级而不是被修补的原因）。
+5. `store.chunk_blocks()`（标题栈切块，`CHUNKER_VERSION = "v2"`）：标题按 level 弹栈、容忍跳级（H1 直接到 H3 时中间层留空）；chunk 正文前挂**就近标题**前缀，`_context_prefix` 预算 60 字，从最贴近正文的标题往上取——全文档共用的 H1 不进每个 chunk，否则它的词会被塞进每一块的 BM25 词袋，idf 被压低、文档长度被拉长，等于给检索加噪声（轻量版父子块：完整路径只写进 `metadata.heading_path`）。>400 字按句末边界切、留 50 字重叠；**表格块不跨块切**（拆开后单元格脱离列名，表格就变成噪声）；短块过滤阈值从 `len < 10` 降到 `MIN_BLOCK_CHARS = 6`（旧值会吞掉「本条与上一条一致」这类有效条款，新值只滤掉纯符号/空白块）；正文原文一字不改（`gold_contains` 靠正文子串匹配，前缀只能增不能改）。
+6. 缓存 salt 加入 `chunk{CHUNKER_VERSION}`（`pipeline.py`）：切块逻辑变更时旧答案缓存自动失效，不依赖人工删 `cache/answers.json`，也不会拿旧切块的缓存去验新切块的效果。
+7. `ingest.py`：`READERS` 按扩展名分发，白名单加 `.docx`；静默跳过改成 `[skip] unsupported: deck.pptx（未接入 PowerPoint reader）`，`.doc/.docm` 给出「请先另存为 .docx」这类可执行的原因；抽取异常 `[fail] 文件名: 原因` 且 `sys.exit(1)`——入库不完整必须让调用方知道。
+
+**效果**（语料 6→8 份、题集 30→49 题；`reports/baseline_before_format.md` → `reports/eval_report.md`）：
+
+| 指标 | 改造前 | 改造后 | 说明 |
+|---|---|---|---|
+| 入口格式 | txt / pdf | docx / md / txt / pdf | 新增 reader 2 个，切块器改动 **0** 次 |
+| 索引 chunks | 43 | 57 | 新增 docx 11 块（含 2 个表格块）、md 10 块（含 1 个表格块）；同一批 6 份 txt/pdf 由 43 → 36，因为 7 个孤立标题行不再单独成块，改为挂进正文前缀 + `heading_path` |
+| Context Precision（hybrid，rerank 关） | 1.000 | 0.892 | 全部下降来自新增题，见下面分组表 |
+| Recall | 1.000 | 0.973 | 未退化到目标线以下 |
+| Faithfulness | 0.951 | 0.929 | 目标 0.85，达标 |
+| Refusal Appropriateness | 1.000 | 1.000 | 应拒题 10 → 12 道，全拦 |
+| Answer Compliance / Style | 1.000 / 1.000 | 0.987 / 0.973 | 达标 |
+
+指标从 1.000 掉到 0.892 容易被读成「改造做坏了」，所以做了同库分组复算（同一份 57 块索引，只切题集）——**下降 100% 来自新增的 17 道题，老 20 题一点没退化**：
+
+| 题组 | rerank 关：CP / top1 | rerank 开：CP / top1 |
+|---|---|---|
+| 老 20 题 q01~q20 | **1.000 / 1.000** | 0.950 / 0.900 |
+| 新 17 题 q21~q34 + e01~e03 | 0.765 / 0.647 | 0.804 / 0.706 |
+
+但 rerank 开时老题从 1.000 掉到 0.950（`q06 产假`、`q08 婚假` 掉出 top1），这是本次改造**直接制造的新缺陷**。用两次消融定位（在 40 块子库上复算一遍 + 把标题前缀剥掉复算一遍），归因互斥且干净：
+
+| 失败题 | 唯一成因 | 证据 |
+|---|---|---|
+| q06 产假一共多少天？ | **标题前缀污染兄弟块**：前缀「第三章 婚假与产假」把 `产` 字塞进了「哺乳假」那一块（它正文里本来没有 `产`），`token_cover` 从 0.429 涨到 0.571，反超真正含「158 天」的块（base 0.8579 明显更高，但 cover 只有 0.429），rerank 分差仅 0.0016 | 剥掉前缀后 top1 立即恢复；与库大小无关（40 块 / 57 块都复现）→ 前缀是唯一变量 |
+| q08 婚假几天？再婚能休吗？ | **BM25 的 min-max 基准随语料漂移**：正确块 base 一直是 0.8354 没动，干扰块（OCR 出来的探亲假条款）的归一化 BM25 因新增 17 块改变了分布，base 0.7378 → 0.7592，rerank 0.6246 → 0.6363 完成反超。它的 cover 0.625 之所以高于婚假块的 0.500，是单字切词把「未**婚**」「不**能**」当成了 `婚`、`能` | 去掉 docx/md 两份新文件后 top1 恢复；与前缀无关（剥不剥都一样）→ 语料规模是唯一变量。这是 `retrieve._minmax()` 的量纲问题在**排序**上的重现（问题五发生在**拒答**上） |
+| e01 / e02 / e03（英文题） | **跨语言查询下 BM25 这条腿有害**：`How many consecutive days can I work remotely?` 的正确块在纯向量里排**第 3**（v=0.6410），混合融合后被挤到**第 13/57**，直接掉出 `top_k=8` | 三模式对照 rank：vector-only = 2/1/3，hybrid = 3/3/>3，英文题全劣化。但不能一刀切关掉 BM25——同一批里 `q26 法定节假日加班`（中文）是 hybrid 救回来的（vector >3 → hybrid 2）。结论：BM25 权重要按查询语言分档，不能全局固定 0.45 |
+
+新 17 题自身还暴露两个模式（不是本次改造引入，但被这次扩语料第一次量化）：
+
+- **摘要式旧文档抢赢明细式新文档**：q26 的 top1 是《摘编》里那句「法定节假日加班按 3 倍工资发放」，而 gold 串 `3.0 倍工资` 只在 docx 表格里。同一事实在库里存在两种精度、两种表述，缺版本与生效日期优先级。（注：这道题 top1 其实答对了意思，是 gold 子串过严判的 miss——记录时不把它算作检索错。）
+- **e03 是最危险的新失败**：top1 拿「每月最多 4 天」回答了「连续几天」这个**不同限定条件**的问题，主题词全对、答案错，而且余弦 0.7555 远高于 `refuse_threshold=0.55`，低置信门不会拦。这类「答得像、其实答错」是拒答链路设计上最防不住的一种。
+
+上述三条**只记录、未修**，与 README §6 第 10 条同批登记（用户口径：先诊断，明确说了改再动代码）。
+
+**已知限制（写进 README，不藏着）**：
+- python-docx 读不到文本框（TextBox）与图片里的文字；合并单元格会按跨度把同一文本重复读出，表现为键值行里出现重复列名。
+- `.doc` / `.docm` / `.pptx` / `.xlsx` / 图片不在 `READERS` 里，入库时显式打印 `[skip] unsupported:` 并附原因，不会静默丢失。
+- md reader 只认 ATX 标题（`#`）与管道表格，不解析 HTML 标签、YAML front-matter；无序列表整体合成一个段落块、保留 `- ` 原文，不按列表项切块（切项会让每条丢失上下文）。
+- 表格块不参与 >400 字再切，因此一张超大表会成为一个长 chunk（当前语料最大表格 3 行 × 3 列，未触及）。
+
+复现：
+
+```bash
+python scripts/make_structured_docs.py   # 生成 data/leave_management_policy.docx（H1/H2/H3 样式 + 两张 3 列表格：考勤认定、加班倍率）与 data/remote_work_policy.md（# 层级 + GFM 表格 + 围栏代码块）
+python ingest.py                         # 报告里的 per_file.blocks 给出每文件 heading/paragraph/table 计数
+python eval.py                           # 与 reports/baseline_before_format.md 对比
+```
+
+分组归因与消融（不改仓库代码，直接复算上表）：
+
+```bash
+PYTHONIOENCODING=utf-8 python -c "import pipeline, eval as E; cfg=dict(pipeline.load_config()); qs=E.load_questions(); old={f'q{i:02d}' for i in range(1,21)}; \
+g=[q for q in qs if q['expect']=='answer' and q['id'] in old]; n=[q for q in qs if q['expect']=='answer' and q['id'] not in old]; \
+print('old', E.eval_retrieval(g,'hybrid',True,cfg)); print('new', E.eval_retrieval(n,'hybrid',True,cfg))"
+```

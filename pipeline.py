@@ -147,7 +147,8 @@ def answer_question(payload: dict, cfg: dict = None) -> dict:
         return finish({}, "safety", True, answer=safety._REFUSAL_SCOPE)
 
     # 2) 缓存
-    key = cache.make_key(question, mode, rerank, llm.cache_salt())
+    key = cache.make_key(question, mode, rerank,
+                         f"{llm.cache_salt()}|chunk{store.CHUNKER_VERSION}")
     if cfg["cache_enabled"]:
         entry = cache.get(key, cfg["cache_ttl_seconds"])
         if entry:

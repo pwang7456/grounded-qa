@@ -7,6 +7,7 @@ import re
 import threading
 import urllib.error
 import urllib.request
+import uuid
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 import chromadb
@@ -19,7 +20,6 @@ CHROMA_DIR = os.path.join(BASE_DIR, "chroma_data")
 COLLECTION_NAME = "internal_kb"
 DIM = 384
 TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9]+")
-PARA_RE = re.compile(r"\n\s*\n")
 
 _lock = threading.RLock()  # 可重入：get_all_chunks 持锁内会再进 get_client
 _client = None
@@ -212,24 +212,89 @@ def detect_language(text: str) -> str:
     return "zh" if cjk * 2 >= latin else "en"
 
 
-def chunk_text(text: str, filename: str, ocr: bool = False):
+CHUNKER_VERSION = "v3"  # 切块逻辑版本，参与缓存 salt：切块/元数据契约变更后旧缓存自动失效
+HEADING_PATH_SEP = " > "
+MAX_CHUNK_CHARS = 400
+OVERLAP_CHARS = 50
+MIN_BLOCK_CHARS = 6
+MAX_PREFIX_CHARS = 60
+SENT_ENDINGS = "。！？；;\n"
+
+
+def _context_prefix(stack, budget: int = MAX_PREFIX_CHARS) -> str:
+    """标题路径前缀：从最贴近正文的标题往上取，超出预算就停（最上层文档名最先被舍）。
+
+    全文档共用的 H1 若进每个 chunk，会把它的词塞进每一块的 BM25 词袋——idf 被压低、
+    文档长度被拉长，等于给检索加噪声，所以这里给前缀设上限而不是无脑拼完整路径。
+    """
+    picked, used = [], 0
+    for _, title in reversed(stack):
+        cost = len(title) + (len(HEADING_PATH_SEP) if picked else 0)
+        if picked and used + cost > budget:
+            break
+        picked.append(title)
+        used += cost
+    return HEADING_PATH_SEP.join(reversed(picked))
+
+
+def _split_long(body: str, limit: int = MAX_CHUNK_CHARS, overlap: int = OVERLAP_CHARS):
+    """超长正文按句末边界切开，相邻块保留 overlap 字重叠，防止关键句恰好骑在边界上。"""
+    n = len(body)
+    if n <= limit:
+        return [body]
+    parts, start = [], 0
+    while start < n:
+        end = min(start + limit, n)
+        if end < n:
+            floor = start + int(limit * 0.4)
+            cut = max((body.rfind(sep, floor, end + 1) for sep in SENT_ENDINGS), default=-1)
+            if cut > start:
+                end = cut + 1
+        piece = body[start:end].strip()
+        if piece:
+            parts.append(piece)
+        if end >= n:
+            break
+        start = max(end - overlap, start + 1)  # 单调推进，避免重叠导致死循环
+    return parts
+
+
+def chunk_blocks(blks, filename: str, ocr: bool = False):
+    """Block 列表 → chunks。每个 chunk 文本 = 标题路径前缀 + 正文；
+    正文原文一字不改（eval 的 gold_contains 靠正文子串匹配，前缀只能增不能改）。"""
     chunks = []
-    for i, para in enumerate(PARA_RE.split(text)):
-        body = para.strip()
-        if len(body) < 10:
+    stack = []  # [(level, title)]
+    idx = 0
+    for b in blks:
+        if b["type"] == "heading":
+            while stack and stack[-1][0] >= b["level"]:
+                stack.pop()
+            stack.append((b["level"], b["text"]))
             continue
-        chunks.append(
-            {
-                "id": f"{filename}:{i}",
-                "text": body,
+        full_path = HEADING_PATH_SEP.join(t for _, t in stack)
+        prefix = _context_prefix(stack)
+        # 表格块不跨块切：拆开后单元格会脱离列名，等于把表格变成噪声
+        bodies = [b["text"]] if b["type"] == "table" else _split_long(b["text"])
+        for body in bodies:
+            if len(body) < MIN_BLOCK_CHARS:
+                continue
+            text = f"{prefix}：{body}" if prefix else body
+            chunks.append({
+                "id": f"{filename}:{idx}",
+                "text": text,
                 "metadata": {
                     "source": filename,
-                    "language": detect_language(body),
+                    "language": detect_language(text),
                     "ocr": ocr,
-                    "chunk_index": i,
+                    "chunk_index": idx,
+                    # 完整路径只进 metadata 供溯源展示；进 embedding 的是预算内的尾部前缀
+                    "heading_path": full_path,
+                    "block_type": b["type"],
+                    # rerank 的词面覆盖只在正文上算才不失真；前缀长度供检索层剥离
+                    "prefix_len": len(text) - len(body),
                 },
-            }
-        )
+            })
+            idx += 1
     return chunks
 
 
@@ -239,7 +304,14 @@ def rebuild_index(chunks):
         get_client().delete_collection(COLLECTION_NAME)
     except Exception:
         pass
-    coll = get_collection()  # metadata 携带当前 embedding 指纹
+    # 用 create_collection（而非 get_or_create）：metadata 里的 ingest_id 是跨进程
+    # 缓存失效的哨兵，每次重建必须换新，运行中的服务才能感知索引已换血
+    coll = get_client().create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine",
+                  "embedding": embedding_signature(),
+                  "ingest_id": uuid.uuid4().hex[:12]},
+    )
     if chunks:
         ef = get_embedding_function()
         coll.add(
@@ -281,11 +353,14 @@ def query_vectors(question: str, n: int):
 
 
 def get_all_chunks():
-    """全库 chunks（BM25 用），带缓存。"""
+    """全库 chunks（BM25 用），带缓存。
+
+    版本 = (块数, ingest_id) 双因子：入库进程重建集合后，即使块数恰好相同，
+    ingest_id 也必然变化——单靠 count 判断会让运行中的服务一直用旧语料。"""
     global _all_cache
     with _lock:
         coll = get_collection()
-        version = coll.count()
+        version = (coll.count(), (coll.metadata or {}).get("ingest_id") or "")
         if _all_cache is not None and _all_cache[0] == version:
             return _all_cache[1]
         res = coll.get(include=["documents", "metadatas"])

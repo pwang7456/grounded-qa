@@ -72,12 +72,16 @@ def bm25_scores(query: str, chunks, k1=1.5, b=0.75):
     return scores
 
 
-def rerank_score(query: str, text: str, base_score: float):
-    """rerank = 0.55*score + 0.35*token_cover + 0.10*phrase_hit"""
+def rerank_score(query: str, text: str, base_score: float, body: str = None):
+    """rerank = 0.55*score + 0.35*token_cover + 0.10*phrase_hit
+
+    cover/phrase 只在正文上算：chunk 文本带有标题路径前缀，同章节的块共享大量
+    标题词，词面覆盖会被系统性抬高，排序会偏向“标题像”而不是“正文像”。"""
+    target = body or text
     q_set = set(_tokens(query))
-    d_set = set(_tokens(text))
+    d_set = set(_tokens(target))
     cover = len(q_set & d_set) / len(q_set) if q_set else 0.0
-    phrase = 1.0 if query.strip() and query.strip() in text else 0.0
+    phrase = 1.0 if query.strip() and query.strip() in target else 0.0
     return 0.55 * base_score + 0.35 * cover + 0.10 * phrase
 
 
@@ -88,6 +92,9 @@ def _to_hit(cid, text, meta, score, v_score=None):
         "source": meta.get("source", ""),
         "language": meta.get("language", ""),
         "ocr": bool(meta.get("ocr", False)),
+        "heading_path": meta.get("heading_path", ""),
+        "block_type": meta.get("block_type", "paragraph"),
+        "prefix_len": int(meta.get("prefix_len", 0) or 0),
         "score": round(score, 4),
         "v_score": round(v_score, 4) if v_score is not None else None,
     }
@@ -117,6 +124,8 @@ def search_chunks(question: str, mode: str, top_k: int, return_k: int,
     if rerank_enabled:
         for h in hits:
             h["raw_score"] = h["score"]
-            h["score"] = round(rerank_score(question, h["text"], h["score"]), 4)
+            body = h["text"][h.get("prefix_len", 0):]  # 剥掉标题路径前缀再算词面覆盖
+            h["score"] = round(
+                rerank_score(question, h["text"], h["score"], body=body), 4)
         hits.sort(key=lambda h: h["score"], reverse=True)
     return hits[:return_k]
